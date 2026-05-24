@@ -37,10 +37,23 @@ from priors.schema import (
 from priors.templates import editor_template
 
 app = typer.Typer(
-    add_completion=False,
     no_args_is_help=True,
     help="Local memory for AI-coding lessons.",
 )
+
+
+def _complete_entry_id(incomplete: str) -> list[str]:
+    try:
+        return store.find_by_prefix(incomplete)
+    except Exception:
+        return []
+
+
+def _complete_draft_id(incomplete: str) -> list[str]:
+    try:
+        return [e.id for e in drafts_mod.load_drafts() if e.id.startswith(incomplete)]
+    except Exception:
+        return []
 console = Console()
 err_console = Console(stderr=True)
 
@@ -65,28 +78,52 @@ def init(
     else:
         console.print(f"Priors already initialized at [bold]{home}[/bold]")
 
+    existing_enabled = _current_enabled_adapters()
+    enabled_adapters: set[str] = set(existing_enabled)
+
     claude_json = Path.home() / ".claude.json"
-    if claude_json.exists():
+    claude_dir = Path.home() / ".claude"
+    if claude_json.exists() or claude_dir.exists():
         if wire_claude is None:
-            wire_claude = typer.confirm("Detected Claude Code — wire up MCP server?", default=True)
+            wire_claude = typer.confirm("Detected Claude Code — wire up MCP server + CLAUDE.md adapter?", default=True)
         if wire_claude:
-            changed = _wire_claude_code(claude_json)
-            if changed:
-                console.print(f"Updated [bold]{claude_json}[/bold] — restart Claude Code or run /mcp reload.")
-            else:
-                console.print(f"[dim]{claude_json} already references the priors MCP server.[/dim]")
+            enabled_adapters.add("claude-code")
+            if claude_json.exists():
+                changed = _wire_claude_code(claude_json)
+                if changed:
+                    console.print(f"Updated [bold]{claude_json}[/bold] — restart Claude Code or run /mcp reload.")
+                else:
+                    console.print(f"[dim]{claude_json} already references the priors MCP server.[/dim]")
 
     codex_dir = Path.home() / ".codex"
     if codex_dir.exists():
         codex_config = codex_dir / "config.toml"
         if wire_codex is None:
-            wire_codex = typer.confirm("Detected Codex — wire up MCP server?", default=True)
+            wire_codex = typer.confirm("Detected Codex — wire up MCP server + adapter?", default=True)
         if wire_codex:
+            enabled_adapters.add("codex")
             changed = _wire_codex(codex_config)
             if changed:
                 console.print(f"Updated [bold]{codex_config}[/bold] — restart Codex.")
             else:
                 console.print(f"[dim]{codex_config} already references the priors MCP server.[/dim]")
+
+    # Only persist when host detection added something. Leaving the list empty
+    # preserves the "fallback to all adapters" semantics for users who haven't
+    # opted in / out of anything.
+    if enabled_adapters and set(enabled_adapters) != set(existing_enabled):
+        # AGENTS.md is per-repo with no host — bundle it alongside any host adapter.
+        enabled_adapters.add("agents")
+        new_enabled = ",".join(sorted(enabled_adapters))
+        config_mod.set_("adapters.enabled", new_enabled)
+        console.print(f"Enabled adapters: [bold]{new_enabled}[/bold]")
+
+
+def _current_enabled_adapters() -> list[str]:
+    raw = config_mod.get("adapters.enabled") or ""
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    return [n.strip() for n in str(raw).split(",") if n.strip()]
 
 
 def _wire_claude_code(claude_json: Path) -> bool:
@@ -264,7 +301,7 @@ def list_cmd(
 
 
 @app.command()
-def show(id_or_prefix: str = typer.Argument(...)) -> None:
+def show(id_or_prefix: str = typer.Argument(..., autocompletion=_complete_entry_id)) -> None:
     """Print a single entry as rendered markdown."""
     matches = store.find_by_prefix(id_or_prefix)
     if not matches:
@@ -290,7 +327,7 @@ def show(id_or_prefix: str = typer.Argument(...)) -> None:
 
 
 @app.command()
-def edit(id_or_prefix: str = typer.Argument(...)) -> None:
+def edit(id_or_prefix: str = typer.Argument(..., autocompletion=_complete_entry_id)) -> None:
     """Open an entry in $EDITOR."""
     matches = store.find_by_prefix(id_or_prefix)
     if not matches:
@@ -311,7 +348,7 @@ def edit(id_or_prefix: str = typer.Argument(...)) -> None:
 
 @app.command()
 def rm(
-    id_or_prefix: str = typer.Argument(...),
+    id_or_prefix: str = typer.Argument(..., autocompletion=_complete_entry_id),
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Delete an entry."""
@@ -578,10 +615,50 @@ def drafts(
     age: Optional[str] = typer.Option(None, "--age", help="e.g. 30d — only show drafts older than this."),
     rm: bool = typer.Option(False, "--rm", help="Delete the listed drafts."),
     reject_all_nits: bool = typer.Option(False, "--reject-all-nits", help="Delete drafts below severity floor."),
+    stats: bool = typer.Option(False, "--stats", help="Print acceptance/rejection rate over the recent window."),
+    window: int = typer.Option(30, "--window", help="Window in days for --stats."),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """List or prune pending AI drafts."""
     items = drafts_mod.load_drafts()
+    if stats:
+        from priors import effectiveness as eff
+        s = eff.aggregate_drafts(eff.load_events(), pending=len(items), window_days=window)
+        if as_json:
+            console.print_json(data={
+                "window_days": s.window_days,
+                "proposed": s.proposed,
+                "written": s.written,
+                "rejected_by_guard": s.rejected_by_guard,
+                "rejected_by_reason": dict(s.rejected_by_reason),
+                "approved": s.approved,
+                "reviewed_rejected": s.reviewed_rejected,
+                "pending": s.pending,
+                "acceptance_rate": s.acceptance_rate,
+                "write_rate": s.write_rate,
+            })
+            return
+        console.print(f"[bold]Draft stats (last {s.window_days}d)[/bold]")
+        console.print(f"  propose_entry calls: {s.proposed}  "
+                      f"(written: {s.written}, blocked by guard: {s.rejected_by_guard})")
+        if s.write_rate is not None:
+            console.print(f"  write rate (post-guard): {s.write_rate * 100:.0f}%")
+        if s.rejected_by_reason:
+            console.print("  rejections by reason:")
+            for reason, count in s.rejected_by_reason:
+                console.print(f"    {count:>4}  {reason}")
+        console.print(f"  reviewed: {s.approved + s.reviewed_rejected}  "
+                      f"(approved: {s.approved}, rejected: {s.reviewed_rejected})")
+        if s.acceptance_rate is not None:
+            pct = s.acceptance_rate * 100
+            hint = ""
+            if pct < 50:
+                hint = "  [dim]→ model is drafting too liberally; tighten guards[/dim]"
+            elif pct > 90:
+                hint = "  [dim]→ model may not be drafting enough[/dim]"
+            console.print(f"  acceptance rate: {pct:.0f}%{hint}")
+        console.print(f"  pending: {s.pending}")
+        return
     if age:
         cutoff = store._parse_since(age)
         items = [e for e in items if e.date <= cutoff]

@@ -13,6 +13,7 @@ import frontmatter
 import numpy as np
 
 from priors import config as config_mod
+from priors import effectiveness as eff
 from priors.paths import (
     draft_rate_path,
     drafts_dir,
@@ -79,6 +80,7 @@ def delete_draft(draft_id: str, *, keep_rejected: bool | None = None) -> None:
         path.rename(rejected_drafts_dir() / path.name)
     else:
         path.unlink()
+    eff.record_draft_rejected(draft_id)
 
 
 def approve_draft(draft_id: str) -> Entry:
@@ -91,6 +93,7 @@ def approve_draft(draft_id: str) -> Entry:
     new_entry = entry_from_frontmatter(fm, post.content)
     store.write(new_entry, overwrite=True)
     path.unlink()
+    eff.record_draft_approved(draft_id)
     return new_entry
 
 
@@ -111,6 +114,32 @@ def propose(
 
     Raises DraftError for every rejection path so callers can surface a clean error.
     """
+    try:
+        result = _propose_inner(
+            trigger=trigger, body=body, rule=rule, tags=tags, model=model,
+            severity=severity, proposed_in=proposed_in, session_count=session_count,
+            today=today, embed_fn=embed_fn,
+        )
+    except DraftError as exc:
+        eff.record_propose_rejected(exc.code, model=model)
+        raise
+    eff.record_draft_written(result["draft_id"], model=model)
+    return result
+
+
+def _propose_inner(
+    *,
+    trigger: str,
+    body: str,
+    rule: str,
+    tags: list[str],
+    model: str,
+    severity: str,
+    proposed_in: str | None,
+    session_count: int,
+    today: date_cls | None,
+    embed_fn,
+) -> dict[str, Any]:
     if severity not in ALLOWED_DRAFT_SEVERITIES:
         raise DraftError(
             "severity_too_low",

@@ -16,6 +16,10 @@ log = logging.getLogger(__name__)
 
 FIRE = "fire"
 NEAR_MISS = "near_miss"
+PROPOSE_REJECTED = "propose_rejected"
+DRAFT_WRITTEN = "draft_written"
+DRAFT_APPROVED = "draft_approved"
+DRAFT_REJECTED = "draft_rejected"
 
 
 def _now_iso() -> str:
@@ -63,6 +67,83 @@ def record_near_miss(
         "model": model,
         "score": score,
     })
+
+
+def record_propose_rejected(reason: str, *, model: str | None = None) -> None:
+    _append({"type": PROPOSE_REJECTED, "ts": _now_iso(), "reason": reason, "model": model})
+
+
+def record_draft_written(draft_id: str, *, model: str | None = None) -> None:
+    _append({"type": DRAFT_WRITTEN, "ts": _now_iso(), "draft_id": draft_id, "model": model})
+
+
+def record_draft_approved(draft_id: str) -> None:
+    _append({"type": DRAFT_APPROVED, "ts": _now_iso(), "draft_id": draft_id})
+
+
+def record_draft_rejected(draft_id: str) -> None:
+    _append({"type": DRAFT_REJECTED, "ts": _now_iso(), "draft_id": draft_id})
+
+
+@dataclass
+class DraftStats:
+    proposed: int
+    written: int
+    rejected_by_guard: int
+    rejected_by_reason: list[tuple[str, int]]
+    approved: int
+    reviewed_rejected: int
+    pending: int
+    acceptance_rate: float | None  # approved / (approved + reviewed_rejected)
+    write_rate: float | None       # written / proposed
+    window_days: int
+
+
+def aggregate_drafts(
+    events: list[dict[str, Any]],
+    *,
+    pending: int = 0,
+    window_days: int = 30,
+    today: date_cls | None = None,
+) -> DraftStats:
+    today = today or date_cls.today()
+    cutoff = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc) - timedelta(days=window_days)
+
+    written = 0
+    rejected_guard = 0
+    approved = 0
+    reviewed_rejected = 0
+    reasons: Counter[str] = Counter()
+
+    for ev in events:
+        ts = _parse_ts(ev.get("ts", ""))
+        if ts is None or ts < cutoff:
+            continue
+        t = ev.get("type")
+        if t == DRAFT_WRITTEN:
+            written += 1
+        elif t == PROPOSE_REJECTED:
+            rejected_guard += 1
+            reasons[str(ev.get("reason") or "unknown")] += 1
+        elif t == DRAFT_APPROVED:
+            approved += 1
+        elif t == DRAFT_REJECTED:
+            reviewed_rejected += 1
+
+    proposed = written + rejected_guard
+    reviewed = approved + reviewed_rejected
+    return DraftStats(
+        proposed=proposed,
+        written=written,
+        rejected_by_guard=rejected_guard,
+        rejected_by_reason=reasons.most_common(),
+        approved=approved,
+        reviewed_rejected=reviewed_rejected,
+        pending=pending,
+        acceptance_rate=(approved / reviewed) if reviewed else None,
+        write_rate=(written / proposed) if proposed else None,
+        window_days=window_days,
+    )
 
 
 def load_events(path: Path | None = None) -> list[dict[str, Any]]:
